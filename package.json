@@ -1,0 +1,14 @@
+{
+  "name": "git-forge-core",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A GitHub-compatible git forge in pure Node: smart HTTP git, REST v3, GraphQL v4 and MCP, all in memory",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
