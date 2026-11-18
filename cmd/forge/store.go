@@ -212,22 +212,27 @@ type Pull struct {
 	Seq            int64
 }
 
+const fastIssueSlotCount = 1024
+
 type Repo struct {
 	GitRepo
 
 	ID          int64
 	Owner       string
 	Name        string
+	lowerKeyStr string
 	Description *string
 	Private     bool
 	Archived    bool
 	HasIssues   bool
 	CreatedAt   string
 	UpdatedAt   string
+	deleted     atomic.Bool
 
 	labels     map[string]*Label // by lowercase name
 	labelList  []*Label          // insertion order (a rename moves the label to the end)
 	issues     map[int64]*Issue
+	issueSlots [fastIssueSlotCount]atomic.Pointer[Issue]
 	issueList  []*Issue
 	pulls      map[int64]*Pull
 	pullList   []*Pull
@@ -238,6 +243,7 @@ type Repo struct {
 
 var (
 	reposByKey   = map[string]*Repo{}
+	repoMapSnap  atomic.Pointer[map[string]*Repo]
 	reposByID    = map[int64]*Repo{}
 	repoList     = []*Repo{} // creation order
 	issuesByID   = map[int64]*Issue{}
@@ -248,6 +254,19 @@ var (
 	nextEntityID int64 = 2_000_001
 	nextSeq      int64 = 1
 )
+
+func init() {
+	empty := map[string]*Repo{}
+	repoMapSnap.Store(&empty)
+}
+
+func publishRepoMap() {
+	snap := make(map[string]*Repo, len(reposByKey))
+	for k, v := range reposByKey {
+		snap[k] = v
+	}
+	repoMapSnap.Store(&snap)
+}
 
 func entityID() int64 {
 	id := nextEntityID
@@ -334,26 +353,28 @@ func createRepo(name, description, private, autoInit, defaultBranch any) *Repo {
 		branch = s
 	}
 	repo := &Repo{
-		ID:         nextRepoID,
-		Owner:      viewerLogin,
-		Name:       clean,
-		Private:    private == true,
-		HasIssues:  true,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		labels:     map[string]*Label{},
-		issues:     map[int64]*Issue{},
-		pulls:      map[int64]*Pull{},
-		nextNumber: 1,
+		ID:          nextRepoID,
+		Owner:       viewerLogin,
+		Name:        clean,
+		lowerKeyStr: repoKey(viewerLogin, clean),
+		Private:     private == true,
+		HasIssues:   true,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		labels:      map[string]*Label{},
+		issues:      map[int64]*Issue{},
+		pulls:       map[int64]*Pull{},
+		nextNumber:  1,
 	}
 	nextRepoID++
 	if s, ok := description.(string); ok {
 		repo.Description = &s
 	}
 	repo.InitGit(branch)
-	reposByKey[repoKey(repo.Owner, repo.Name)] = repo
+	reposByKey[repo.lowerKeyStr] = repo
 	reposByID[repo.ID] = repo
 	repoList = append(repoList, repo)
+	publishRepoMap()
 	if autoInit == true {
 		putContents(repo, "README.md", contentsInput{message: "Initial commit", content: []byte("# " + clean + "\n")})
 	}
@@ -369,9 +390,14 @@ func updateRepo(repo *Repo, patch map[string]any) {
 		if reposByKey[repoKey(repo.Owner, name)] != nil {
 			apiFail(422, "Repository creation failed.", O("resource", "Repository", "code", "custom", "field", "name", "message", "name already exists on this account"))
 		}
-		delete(reposByKey, repoKey(repo.Owner, repo.Name))
+		delete(reposByKey, repo.lowerKeyStr)
 		repo.Name = name
-		reposByKey[repoKey(repo.Owner, repo.Name)] = repo
+		repo.lowerKeyStr = repoKey(repo.Owner, repo.Name)
+		reposByKey[repo.lowerKeyStr] = repo
+		publishRepoMap()
+		for _, issue := range repo.issueList {
+			issue.invalidate()
+		}
 	}
 	if v, present := patch["description"]; present {
 		if s, ok := v.(string); ok {
@@ -395,14 +421,16 @@ func updateRepo(repo *Repo, patch map[string]any) {
 		}
 		repo.Mu.Lock()
 		repo.DefaultBranch = branch
-		repo.RefsVersion++
+		atomic.AddUint64(&repo.RefsVersion, 1)
 		repo.Mu.Unlock()
 	}
 	repo.UpdatedAt = NextISO()
 }
 
 func deleteRepo(repo *Repo) {
-	delete(reposByKey, repoKey(repo.Owner, repo.Name))
+	repo.deleted.Store(true)
+	delete(reposByKey, repo.lowerKeyStr)
+	publishRepoMap()
 	delete(reposByID, repo.ID)
 	if i := slices.Index(repoList, repo); i >= 0 {
 		repoList = slices.Delete(repoList, i, i+1)
@@ -782,6 +810,9 @@ func createIssue(repo *Repo, titleArg, body, labels any, user string) *Issue {
 		issue.Body = &s
 	}
 	repo.issues[issue.Number] = issue
+	if issue.Number >= 1 && issue.Number < fastIssueSlotCount {
+		repo.issueSlots[issue.Number].Store(issue)
+	}
 	repo.issueList = append(repo.issueList, issue)
 	issuesByID[issue.ID] = issue
 	return issue

@@ -10,17 +10,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"io"
 	"math"
-	"net"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 	"unicode/utf8"
 )
 
@@ -553,38 +550,58 @@ type httpRequest struct {
 }
 
 type httpConn struct {
-	nc  net.Conn
-	buf []byte
-	r   int // start of unread data
-	w   int // end of unread data
-	out []byte
-	key []byte
+	nc        io.ReadWriteCloser
+	buf       []byte
+	r         int // start of unread data
+	w         int // end of unread data
+	out       []byte
+	jsonBuf   []byte
+	key       []byte
+	authed    [128]byte
+	authedLen int
+	lastRepo  *Repo
 }
 
-// serveHTTP accepts connections until the listener closes.
-func serveHTTP(ln net.Listener) {
-	for {
-		nc, err := ln.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-			continue
-		}
-		if tc, ok := nc.(*net.TCPConn); ok {
-			tc.SetNoDelay(true)
-		}
-		go (&httpConn{nc: nc}).serve()
+var httpConnPool = sync.Pool{New: func() any {
+	return &httpConn{
+		buf:     make([]byte, 16<<10),
+		out:     make([]byte, 0, 8<<10),
+		jsonBuf: make([]byte, 0, 1<<10),
+		key:     make([]byte, 0, 128),
 	}
+}}
+
+func serveConn(nc io.ReadWriteCloser) {
+	c := httpConnPool.Get().(*httpConn)
+	c.nc = nc
+	c.r, c.w = 0, 0
+	c.authedLen = 0
+	c.lastRepo = nil
+	if len(c.buf) != 16<<10 {
+		c.buf = make([]byte, 16<<10)
+	}
+	c.serve()
+	c.nc = nil
+	c.lastRepo = nil
+	if cap(c.out) > 64<<10 {
+		c.out = make([]byte, 0, 8<<10)
+	}
+	if cap(c.jsonBuf) > 16<<10 {
+		c.jsonBuf = make([]byte, 0, 1<<10)
+	}
+	httpConnPool.Put(c)
 }
 
 func (c *httpConn) serve() {
 	defer c.nc.Close()
-	c.buf = make([]byte, 16<<10)
-	c.out = make([]byte, 0, 8<<10)
-	c.key = make([]byte, 0, 128)
 	var req httpRequest
+	defer func() {
+		if r := recover(); r != nil {
+			head := bytes.Equal(req.method, []byte("HEAD"))
+			frame := errorFrame(500, "Server Error: "+jsString(panicValue(r)), nil, "Connection: close\r\n")
+			_ = c.write(frame, head)
+		}
+	}()
 	for {
 		req = httpRequest{}
 		status := c.readRequest(&req)
@@ -679,59 +696,73 @@ func (c *httpConn) readRequest(req *httpRequest) int {
 		}
 		name := field[:colon]
 		value := bytes.Trim(field[colon+1:], " \t")
-		switch {
-		case asciiEqualFold(name, "host"):
-			if !req.hasHost {
+		switch len(name) {
+		case 4:
+			if asciiEqualFold(name, "host") && !req.hasHost {
 				req.host, req.hasHost = value, true
 			}
-		case asciiEqualFold(name, "authorization"):
-			if req.auth == nil {
+		case 6:
+			if asciiEqualFold(name, "accept") {
+				req.accept = joinHeader(req.accept, value)
+			} else if asciiEqualFold(name, "expect") {
+				req.expectContinue = asciiEqualFold(value, "100-continue")
+			}
+		case 10:
+			if (name[0]|0x20) == 'c' && asciiEqualFold(name, "connection") {
+				switch {
+				case asciiEqualFold(value, "keep-alive"): // what undici sends on every request
+					req.keepAlive = true
+				case asciiEqualFold(value, "close"):
+					req.keepAlive = false
+				default: // a token list, scanned in place
+					for list := value; len(list) > 0; {
+						token := list
+						if comma := bytes.IndexByte(list, ','); comma >= 0 {
+							token, list = list[:comma], list[comma+1:]
+						} else {
+							list = nil
+						}
+						token = bytes.TrimSpace(token)
+						if asciiEqualFold(token, "close") {
+							req.keepAlive = false
+						} else if asciiEqualFold(token, "keep-alive") {
+							req.keepAlive = true
+						}
+					}
+				}
+			}
+		case 12:
+			if asciiEqualFold(name, "git-protocol") {
+				req.gitProtocol = joinHeader(req.gitProtocol, value)
+			}
+		case 13:
+			if asciiEqualFold(name, "authorization") && req.auth == nil {
 				req.auth = value
 			}
-		case asciiEqualFold(name, "content-length"):
-			if !req.hasLength {
-				n, err := strconv.ParseInt(string(value), 10, 64)
-				if err != nil || n < 0 {
+		case 14:
+			if (name[0]|0x20) == 'c' && asciiEqualFold(name, "content-length") && !req.hasLength {
+				var n int64
+				if len(value) == 0 || len(value) > 18 {
 					return 400
+				}
+				for _, d := range value {
+					if d < '0' || d > '9' {
+						return 400
+					}
+					n = n*10 + int64(d-'0')
 				}
 				req.contentLength, req.hasLength = n, true
 			}
-		case asciiEqualFold(name, "transfer-encoding"):
-			if bytes.Contains(bytes.ToLower(value), []byte("chunked")) {
-				req.chunked = true
-			}
-		case asciiEqualFold(name, "content-encoding"):
-			if req.contentEncoding == nil {
+		case 16:
+			if asciiEqualFold(name, "content-encoding") && req.contentEncoding == nil {
 				req.contentEncoding = value
 			}
-		case asciiEqualFold(name, "connection"):
-			switch {
-			case asciiEqualFold(value, "keep-alive"): // what undici sends on every request
-				req.keepAlive = true
-			case asciiEqualFold(value, "close"):
-				req.keepAlive = false
-			default: // a token list, scanned in place
-				for list := value; len(list) > 0; {
-					token := list
-					if comma := bytes.IndexByte(list, ','); comma >= 0 {
-						token, list = list[:comma], list[comma+1:]
-					} else {
-						list = nil
-					}
-					token = bytes.TrimSpace(token)
-					if asciiEqualFold(token, "close") {
-						req.keepAlive = false
-					} else if asciiEqualFold(token, "keep-alive") {
-						req.keepAlive = true
-					}
+		case 17:
+			if asciiEqualFold(name, "transfer-encoding") {
+				if bytes.Contains(bytes.ToLower(value), []byte("chunked")) {
+					req.chunked = true
 				}
 			}
-		case asciiEqualFold(name, "git-protocol"):
-			req.gitProtocol = joinHeader(req.gitProtocol, value)
-		case asciiEqualFold(name, "accept"):
-			req.accept = joinHeader(req.accept, value)
-		case asciiEqualFold(name, "expect"):
-			req.expectContinue = asciiEqualFold(value, "100-continue")
 		}
 	}
 	c.r = headEnd
@@ -800,7 +831,7 @@ func (c *httpConn) readLine() ([]byte, bool) {
 }
 
 func (c *httpConn) readChunked() ([]byte, int) {
-	body := []byte{}
+	var body []byte
 	for {
 		line, ok := c.readLine()
 		if !ok {
@@ -820,12 +851,18 @@ func (c *httpConn) readChunked() ([]byte, int) {
 					return nil, -1
 				}
 				if len(trailer) == 0 {
+					if body == nil {
+						body = []byte{}
+					}
 					return body, 0
 				}
 			}
 		}
 		if int64(len(body))+size > maxBodyBytes {
 			return nil, 413
+		}
+		if body == nil {
+			body = make([]byte, 0, min(maxBodyBytes, max(int(size), 4096)))
 		}
 		for remaining := int(size); remaining > 0; {
 			if c.r == c.w && !c.fill() {
@@ -846,21 +883,43 @@ func (c *httpConn) readChunked() ([]byte, int) {
 }
 
 // handle answers one request; false means the connection must close.
-func (c *httpConn) handle(req *httpRequest) (keep bool) {
-	head := bytes.Equal(req.method, []byte("HEAD"))
-	defer func() {
-		if r := recover(); r != nil {
-			frame := errorFrame(500, "Server Error: "+jsString(panicValue(r)), nil, "")
-			keep = c.write(frame, head)
-		}
-	}()
+func (c *httpConn) handle(req *httpRequest) bool {
 	if c.fastIssue(req) || c.fastCreateIssue(req) {
 		return true
 	}
+	head := bytes.Equal(req.method, []byte("HEAD"))
 	if frame := c.fastGit(req); frame != nil {
 		return c.write(frame, head)
 	}
 	return c.write(route(req), head)
+}
+
+func (c *httpConn) isAuthorized(header []byte) bool {
+	if c.authedLen > 0 && len(header) == c.authedLen && bytes.Equal(header, c.authed[:c.authedLen]) {
+		return true
+	}
+	if !authorized(header) {
+		return false
+	}
+	if len(header) <= len(c.authed) {
+		c.authedLen = copy(c.authed[:], header)
+	}
+	return true
+}
+
+func (c *httpConn) resolveFastRepo(owner, name []byte) *Repo {
+	if !c.lowerKey(owner, name) {
+		return nil
+	}
+	if last := c.lastRepo; last != nil && !last.deleted.Load() && string(c.key) == last.lowerKeyStr {
+		return last
+	}
+	m := *repoMapSnap.Load()
+	repo := m[string(c.key)]
+	if repo != nil {
+		c.lastRepo = repo
+	}
+	return repo
 }
 
 // lowerKey builds the registry key "owner/name" (ASCII-lowercased) into c.key and reports whether the owner is the
@@ -898,40 +957,68 @@ func splitRepoPath(path []byte) (owner, name, rest []byte, ok bool) {
 }
 
 // fastCreateIssue answers POST /api/v3/repos/{owner}/{repo}/issues when the body is the common {title, body?} shape
-// (no labels): no generic JSON maps, and the 201 reply goes out in one write. Anything else falls through to the
-// general router, which handles every other shape exactly.
+// (no labels): zero reflection, lazy issueFrame caching, and the 201 reply goes out from c.out in one write.
 func (c *httpConn) fastCreateIssue(req *httpRequest) bool {
 	const prefix = "/api/v3/repos/"
 	path := req.path
-	if string(req.method) != "POST" || len(path) <= len(prefix) || string(path[:len(prefix)]) != prefix || !apiBaseKnown.Load() || !authorized(req.auth) {
+	if string(req.method) != "POST" || len(path) <= len(prefix) || string(path[:len(prefix)]) != prefix || !apiBaseKnown.Load() || !c.isAuthorized(req.auth) {
 		return false
 	}
 	owner, name, rest, ok := splitRepoPath(path[len(prefix):])
-	if !ok || string(rest) != "issues" || !c.lowerKey(owner, name) {
+	if !ok || string(rest) != "issues" {
 		return false
 	}
-	title, body, ok := parseIssueBody(req.body)
-	if !ok {
+	repo := c.resolveFastRepo(owner, name)
+	if repo == nil {
 		return false
 	}
-	var f *issueFrame
-	var repoOwner, repoName string
-	var number int64
-	func() {
-		storeMu.Lock()
-		defer storeMu.Unlock()
-		repo := reposByKey[string(c.key)]
-		if repo == nil {
-			return
+	title, bodyPtr, hasBodyPtr, ok := fastScanIssueBody(req.body)
+	var bodyAny any
+	if ok {
+		if hasBodyPtr {
+			bodyAny = bodyPtr
 		}
-		issue := createIssue(repo, title, body, nil, viewerLogin)
-		f, repoOwner, repoName, number = issueFrameOf(issue), repo.Owner, repo.Name, issue.Number
-	}()
-	if f == nil {
+	} else {
+		title, bodyAny, ok = parseIssueBody(req.body)
+		if !ok {
+			return false
+		}
+	}
+	storeMu.Lock()
+	if repo.deleted.Load() {
+		storeMu.Unlock()
 		return false
 	}
+	now := NextISO()
+	issue := &Issue{
+		ID:        entityID(),
+		Number:    repo.nextNumber,
+		Repo:      repo,
+		Title:     title,
+		State:     "open",
+		Labels:    []*Label{},
+		Comments:  []*Comment{},
+		User:      viewerLogin,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	repo.nextNumber++
+	issue.Seq = takeSeq()
+	if s, isStr := bodyAny.(string); isStr {
+		issue.Body = &s
+	}
+	repo.issues[issue.Number] = issue
+	if issue.Number >= 1 && issue.Number < fastIssueSlotCount {
+		repo.issueSlots[issue.Number].Store(issue)
+	}
+	repo.issueList = append(repo.issueList, issue)
+	issuesByID[issue.ID] = issue
+	c.jsonBuf = appendIssueJSON(c.jsonBuf[:0], issue)
+	repoOwner, repoName, number := repo.Owner, repo.Name, issue.Number
+	storeMu.Unlock()
+
 	out := append(c.out[:0], "HTTP/1.1 201 Created\r\nContent-Type: "+jsonContentType+"\r\nContent-Length: "...)
-	out = strconv.AppendInt(out, int64(len(f.json)), 10)
+	out = strconv.AppendInt(out, int64(len(c.jsonBuf)), 10)
 	out = append(out, "\r\nX-GitHub-Request-Id: "...)
 	out = appendRequestID(out, requestCounter.Add(1))
 	out = append(out, "\r\nLocation: "...)
@@ -943,10 +1030,126 @@ func (c *httpConn) fastCreateIssue(req *httpRequest) bool {
 	out = append(out, "/issues/"...)
 	out = strconv.AppendInt(out, number, 10)
 	out = append(out, "\r\n\r\n"...)
-	out = append(out, f.json...)
+	out = append(out, c.jsonBuf...)
 	c.out = out
-	c.nc.Write(out)
-	return true
+	_, err := c.nc.Write(out)
+	return err == nil
+}
+
+func skipJSONWS(b []byte, i int) int {
+	for i < len(b) {
+		switch b[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// fastScanIssueBody scans unescaped {"title":"...","body":"..."|null} directly from raw bytes with zero reflection.
+// Any escape sequence, duplicate key, labels key or unusual token returns ok=false so parseIssueBody handles it.
+func fastScanIssueBody(raw []byte) (title, body string, hasBody, ok bool) {
+	i := skipJSONWS(raw, 0)
+	if i >= len(raw) || raw[i] != '{' {
+		return "", "", false, false
+	}
+	i = skipJSONWS(raw, i+1)
+	if i >= len(raw) || raw[i] == '}' {
+		return "", "", false, false
+	}
+	seenTitle, seenBody := false, false
+	for {
+		if i >= len(raw) || raw[i] != '"' {
+			return "", "", false, false
+		}
+		keyStart := i + 1
+		keyEnd := keyStart
+		for keyEnd < len(raw) && raw[keyEnd] != '"' {
+			if raw[keyEnd] == '\\' || raw[keyEnd] < 0x20 {
+				return "", "", false, false
+			}
+			keyEnd++
+		}
+		if keyEnd >= len(raw) {
+			return "", "", false, false
+		}
+		key := raw[keyStart:keyEnd]
+		i = skipJSONWS(raw, keyEnd+1)
+		if i >= len(raw) || raw[i] != ':' {
+			return "", "", false, false
+		}
+		i = skipJSONWS(raw, i+1)
+		if i >= len(raw) {
+			return "", "", false, false
+		}
+		switch string(key) {
+		case "title":
+			if seenTitle || raw[i] != '"' {
+				return "", "", false, false
+			}
+			valStart := i + 1
+			valEnd := valStart
+			for valEnd < len(raw) && raw[valEnd] != '"' {
+				if raw[valEnd] == '\\' || raw[valEnd] < 0x20 {
+					return "", "", false, false
+				}
+				valEnd++
+			}
+			if valEnd >= len(raw) || !utf8.Valid(raw[valStart:valEnd]) {
+				return "", "", false, false
+			}
+			title = string(raw[valStart:valEnd])
+			seenTitle = true
+			i = valEnd + 1
+		case "body":
+			if seenBody {
+				return "", "", false, false
+			}
+			seenBody = true
+			if raw[i] == '"' {
+				valStart := i + 1
+				valEnd := valStart
+				for valEnd < len(raw) && raw[valEnd] != '"' {
+					if raw[valEnd] == '\\' || raw[valEnd] < 0x20 {
+						return "", "", false, false
+					}
+					valEnd++
+				}
+				if valEnd >= len(raw) || !utf8.Valid(raw[valStart:valEnd]) {
+					return "", "", false, false
+				}
+				body = string(raw[valStart:valEnd])
+				hasBody = true
+				i = valEnd + 1
+			} else if i+4 <= len(raw) && string(raw[i:i+4]) == "null" {
+				hasBody = false
+				i += 4
+			} else {
+				return "", "", false, false
+			}
+		default:
+			return "", "", false, false
+		}
+		i = skipJSONWS(raw, i)
+		if i >= len(raw) {
+			return "", "", false, false
+		}
+		if raw[i] == ',' {
+			i = skipJSONWS(raw, i+1)
+			continue
+		}
+		if raw[i] == '}' {
+			i = skipJSONWS(raw, i+1)
+			break
+		}
+		return "", "", false, false
+	}
+	if i != len(raw) || !seenTitle || jsTrim(title) == "" {
+		return "", "", false, false
+	}
+	return title, body, hasBody, true
 }
 
 // parseIssueBody reads {"title": "...", "body": ...} with exact (case-sensitive) keys and JSON.parse semantics
@@ -1000,8 +1203,8 @@ func parseIssueBody(raw []byte) (title string, body any, ok bool) {
 	return title, body, true
 }
 
-// fastGit routes /{owner}/{repo}.git/... straight from the request bytes, with no lowercased copies or key
-// strings on the clone/push hot path. Unusual paths (escapes, unknown repositories) go to the general router.
+// fastGit routes /{owner}/{repo}.git/... straight from the request bytes, with no lowercased copies, key strings
+// or storeMu locks on the clone/push hot path. Unusual paths (escapes, unknown repositories) go to the general router.
 func (c *httpConn) fastGit(req *httpRequest) []byte {
 	path := req.path
 	if len(path) < 2 || path[0] != '/' || bytes.HasPrefix(path, []byte("/api/v3")) {
@@ -1016,24 +1219,15 @@ func (c *httpConn) fastGit(req *httpRequest) []byte {
 	if next := bytes.IndexByte(segment, '/'); next >= 0 {
 		segment, rest = segment[:next], segment[next:]
 	}
-	if len(segment) <= 4 || string(segment[len(segment)-4:]) != ".git" || !c.lowerKey(owner, segment[:len(segment)-4]) {
+	if len(segment) <= 4 || string(segment[len(segment)-4:]) != ".git" {
 		return nil
 	}
-	storeMu.RLock()
-	repo := reposByKey[string(c.key)]
-	storeMu.RUnlock()
+	repo := c.resolveFastRepo(owner, segment[:len(segment)-4])
 	if repo == nil {
 		return nil
 	}
 	setBase(req.host)
-	return HandleGit(&repo.GitRepo, &GitRequest{
-		Method:          string(req.method),
-		Path:            string(rest),
-		Query:           string(req.query),
-		GitProtocol:     string(req.gitProtocol),
-		ContentEncoding: string(req.contentEncoding),
-		Body:            req.body,
-	})
+	return HandleGitBytes(&repo.GitRepo, req.method, rest, req.query, req.gitProtocol, req.contentEncoding, req.body)
 }
 
 func panicValue(r any) any {
@@ -1054,11 +1248,11 @@ func (c *httpConn) write(frame []byte, headOnly bool) bool {
 }
 
 // fastIssue answers GET /api/v3/repos/{owner}/{repo}/issues/{number} for an existing issue straight from its
-// pre-rendered reply, allocation-free; anything unusual falls through to the general router.
+// pre-rendered reply with zero locks and zero allocations; anything unusual falls through to the general router.
 func (c *httpConn) fastIssue(req *httpRequest) bool {
 	const prefix = "/api/v3/repos/"
 	path := req.path
-	if len(path) <= len(prefix) || string(req.method) != "GET" || string(path[:len(prefix)]) != prefix || !apiBaseKnown.Load() || !authorized(req.auth) {
+	if len(path) <= len(prefix) || string(req.method) != "GET" || string(path[:len(prefix)]) != prefix || !apiBaseKnown.Load() || !c.isAuthorized(req.auth) {
 		return false
 	}
 	owner, name, rest, ok := splitRepoPath(path[len(prefix):])
@@ -1076,23 +1270,36 @@ func (c *httpConn) fastIssue(req *httpRequest) bool {
 		}
 		number = number*10 + int64(d-'0')
 	}
-	if !c.lowerKey(owner, name) {
+	repo := c.resolveFastRepo(owner, name)
+	if repo == nil {
 		return false
 	}
-	storeMu.RLock()
-	repo := reposByKey[string(c.key)]
 	var f *issueFrame
-	if repo != nil {
-		if issue := repo.issues[number]; issue != nil {
-			f = issueFrameOf(issue)
+	if number >= 1 && number < fastIssueSlotCount {
+		if issue := repo.issueSlots[number].Load(); issue != nil {
+			f = issue.frame.Load()
+			if f == nil {
+				storeMu.RLock()
+				if !repo.deleted.Load() {
+					f = issueFrameOf(issue)
+				}
+				storeMu.RUnlock()
+			}
 		}
+	} else {
+		storeMu.RLock()
+		if !repo.deleted.Load() {
+			if issue := repo.issues[number]; issue != nil {
+				f = issueFrameOf(issue)
+			}
+		}
+		storeMu.RUnlock()
 	}
-	storeMu.RUnlock()
 	if f == nil {
 		return false
 	}
-	c.nc.Write(f.http) // the pre-rendered reply, request id and all: no copy, no allocation
-	return true
+	_, err := c.nc.Write(f.http)
+	return err == nil
 }
 
 // ---------------------------------------------------------------- routing (app.ts)

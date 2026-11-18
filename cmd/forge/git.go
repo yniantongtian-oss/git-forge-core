@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -63,6 +64,41 @@ type GitRequest struct {
 	Body            []byte // the raw body, still gzip-encoded when ContentEncoding says so
 }
 
+// HandleGitBytes answers a smart-HTTP request directly from raw byte slices on the hot path with zero string
+// conversions or mutex contention on cached clone/push exchanges; anything unusual delegates to HandleGit.
+func HandleGitBytes(g *GitRepo, method, path, query, gitProtocol, contentEncoding, body []byte) []byte {
+	if string(method) == "GET" && string(path) == "/info/refs" {
+		service := queryServiceBytes(query)
+		if service == "" {
+			return dumbHTTPFrame
+		}
+		if service == "git-upload-pack" && wantsV2Bytes(gitProtocol) {
+			return v2AdvertFrame
+		}
+		return g.fastAdvertV0(service)
+	}
+	if string(method) == "POST" && len(contentEncoding) == 0 {
+		if string(path) == "/git-upload-pack" && wantsV2Bytes(gitProtocol) {
+			if frame := tryFastUploadV2(g, body); frame != nil {
+				return frame
+			}
+		}
+		if string(path) == "/git-receive-pack" {
+			if frame := tryFastReceivePack(g, body); frame != nil {
+				return frame
+			}
+		}
+	}
+	return HandleGit(g, &GitRequest{
+		Method:          string(method),
+		Path:            string(path),
+		Query:           string(query),
+		GitProtocol:     string(gitProtocol),
+		ContentEncoding: string(contentEncoding),
+		Body:            body,
+	})
+}
+
 // HandleGit answers one smart-HTTP request and returns the complete HTTP/1.1 response bytes. The slice may be
 // shared with other requests (cached replies): write it, never modify it.
 func HandleGit(g *GitRepo, req *GitRequest) []byte {
@@ -75,9 +111,7 @@ func HandleGit(g *GitRepo, req *GitRequest) []byte {
 		if service == "git-upload-pack" && wantsV2(req.GitProtocol) {
 			return v2AdvertFrame
 		}
-		g.Mu.RLock()
-		defer g.Mu.RUnlock()
-		return g.cachedFrame("adv:"+service, func() []byte { return advertisementV0(g, service) })
+		return g.fastAdvertV0(service)
 
 	case req.Path == "/git-upload-pack" && req.Method == "POST":
 		body, err := decodeGitBody(req.Body, req.ContentEncoding)
@@ -432,11 +466,12 @@ func AppendSidebandPack(dst []byte, objects []*GitObject) []byte {
 // cachedFrame returns the reply cached under key for the current RefsVersion, building it on a miss. The caller
 // holds g.Mu (read or write), so RefsVersion is stable; any ref change empties the cache on the next access.
 func (g *GitRepo) cachedFrame(key string, build func() []byte) []byte {
+	ver := atomic.LoadUint64(&g.RefsVersion)
 	g.cacheMu.Lock()
 	defer g.cacheMu.Unlock()
-	if g.cache == nil || g.cacheVersion != g.RefsVersion {
+	if g.cache == nil || g.cacheVersion != ver {
 		g.cache = make(map[string][]byte)
-		g.cacheVersion = g.RefsVersion
+		g.cacheVersion = ver
 	}
 	if frame, ok := g.cache[key]; ok {
 		return frame
@@ -444,6 +479,247 @@ func (g *GitRepo) cachedFrame(key string, build func() []byte) []byte {
 	frame := build()
 	g.cache[key] = frame
 	return frame
+}
+
+func (g *GitRepo) fastAdvertV0(service string) []byte {
+	upload := service == "git-upload-pack"
+	ver := atomic.LoadUint64(&g.RefsVersion)
+	if rf := g.refFrames.Load(); rf != nil && rf.version == ver {
+		if upload && rf.uploadAdvert != nil {
+			return rf.uploadAdvert
+		}
+		if !upload && rf.receiveAdvert != nil {
+			return rf.receiveAdvert
+		}
+	}
+	g.Mu.RLock()
+	defer g.Mu.RUnlock()
+	ver = atomic.LoadUint64(&g.RefsVersion)
+	var next gitRefFrames
+	if rf := g.refFrames.Load(); rf != nil && rf.version == ver {
+		if upload && rf.uploadAdvert != nil {
+			return rf.uploadAdvert
+		}
+		if !upload && rf.receiveAdvert != nil {
+			return rf.receiveAdvert
+		}
+		next = *rf
+	} else {
+		next.version = ver
+	}
+	frame := advertisementV0(g, service)
+	if upload {
+		next.uploadAdvert = frame
+	} else {
+		next.receiveAdvert = frame
+	}
+	g.refFrames.Store(&next)
+	return frame
+}
+
+func (g *GitRepo) fastLsRefsPlain(mask int) []byte {
+	ver := atomic.LoadUint64(&g.RefsVersion)
+	if rf := g.refFrames.Load(); rf != nil && rf.version == ver && rf.lsRefsPlain[mask] != nil {
+		return rf.lsRefsPlain[mask]
+	}
+	peel := mask&4 != 0
+	symrefs := mask&2 != 0
+	unborn := mask&1 != 0
+	g.Mu.RLock()
+	defer g.Mu.RUnlock()
+	ver = atomic.LoadUint64(&g.RefsVersion)
+	var next gitRefFrames
+	if rf := g.refFrames.Load(); rf != nil && rf.version == ver {
+		if rf.lsRefsPlain[mask] != nil {
+			return rf.lsRefsPlain[mask]
+		}
+		next = *rf
+	} else {
+		next.version = ver
+	}
+	refs := g.RefsWithPrefix("refs/")
+	buf := newFrameBody(128 + 112*len(refs))
+	headTarget := g.HeadRefName()
+	headOID, hasHead := g.refs[headTarget]
+	switch {
+	case hasHead && symrefs:
+		buf = appendPkt(buf, headOID, " HEAD symref-target:", headTarget, "\n")
+	case hasHead:
+		buf = appendPkt(buf, headOID, " HEAD\n")
+	case unborn:
+		buf = appendPkt(buf, "unborn HEAD symref-target:", headTarget, "\n")
+	}
+	for _, ref := range refs {
+		peeled := ""
+		if peel {
+			peeled = g.peeledOf(ref.OID)
+		}
+		if peeled != "" {
+			buf = appendPkt(buf, ref.OID, " ", ref.Name, " peeled:", peeled, "\n")
+		} else {
+			buf = appendPkt(buf, ref.OID, " ", ref.Name, "\n")
+		}
+	}
+	buf = append(buf, pktFlushLine...)
+	frame := finishFrame(buf, 200, ctUploadResult, GitNoCacheHeaders)
+	next.lsRefsPlain[mask] = frame
+	g.refFrames.Store(&next)
+	return frame
+}
+
+func isOIDBytes(b []byte) bool {
+	if len(b) != 40 {
+		return false
+	}
+	for i := 0; i < 40; i++ {
+		c := b[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// tryFastUploadV2 handles standard v2 ls-refs (no ref-prefix) and single-want fresh clone fetches without
+// packet-slice/string allocations or mutex contention across 50 concurrent clones. Returns nil to fall back.
+func tryFastUploadV2(g *GitRepo, body []byte) []byte {
+	const (
+		cmdNone   = 0
+		cmdLsRefs = 1
+		cmdFetch  = 2
+	)
+	cmd := cmdNone
+	inArgs := false
+	flushed := false
+	mask := 0
+	var want [40]byte
+	wantCount := 0
+	depth := int64(0)
+	done := false
+
+	pos := 0
+	for pos < len(body) {
+		if pos+4 > len(body) {
+			return nil
+		}
+		length := 0
+		for k := 0; k < 4; k++ {
+			v, ok := hexNibble(body[pos+k])
+			if !ok {
+				return nil
+			}
+			length = length<<4 | int(v)
+		}
+		switch length {
+		case 0:
+			pos += 4
+			if pos != len(body) {
+				return nil // trailing packets after flush: let full parser validate
+			}
+			flushed = true
+		case 1:
+			pos += 4
+			if inArgs {
+				return nil
+			}
+			inArgs = true
+			continue
+		case 2:
+			pos += 4
+			continue
+		default:
+			if length < 4 || pos+length > len(body) {
+				return nil
+			}
+			line := body[pos+4 : pos+length]
+			pos += length
+			if len(line) > 0 && line[len(line)-1] == '\n' {
+				line = line[:len(line)-1]
+			}
+			if !inArgs {
+				if cmd == cmdNone && bytes.HasPrefix(line, []byte("command=")) {
+					switch string(line) {
+					case "command=ls-refs":
+						cmd = cmdLsRefs
+					case "command=fetch":
+						cmd = cmdFetch
+					default:
+						return nil
+					}
+				}
+				continue
+			}
+			if cmd == cmdLsRefs {
+				switch string(line) {
+				case "peel":
+					mask |= 4
+				case "symrefs":
+					mask |= 2
+				case "unborn":
+					mask |= 1
+				default:
+					return nil
+				}
+				continue
+			}
+			if cmd == cmdFetch {
+				switch {
+				case string(line) == "thin-pack" || string(line) == "no-progress" || string(line) == "ofs-delta" || string(line) == "include-tag":
+				case string(line) == "done":
+					done = true
+				case bytes.HasPrefix(line, []byte("want ")):
+					oid := line[5:]
+					if !isOIDBytes(oid) || wantCount > 0 {
+						return nil
+					}
+					copy(want[:], oid)
+					wantCount = 1
+				case bytes.HasPrefix(line, []byte("deepen ")):
+					raw := line[7:]
+					if len(raw) == 0 || len(raw) > 9 {
+						return nil
+					}
+					var d int64
+					for _, ch := range raw {
+						if ch < '0' || ch > '9' {
+							return nil
+						}
+						d = d*10 + int64(ch-'0')
+					}
+					if d < 1 {
+						d = 1
+					}
+					depth = d
+				default:
+					return nil
+				}
+			}
+		}
+	}
+	if !flushed {
+		return nil
+	}
+	if cmd == cmdLsRefs {
+		return g.fastLsRefsPlain(mask)
+	}
+	if cmd == cmdFetch && wantCount == 1 && done {
+		if fc := g.fastClone.Load(); fc != nil && fc.v2 && fc.depth == depth && fc.want == want {
+			return fc.frame
+		}
+		wantStr := string(want[:])
+		a := fetchArgs{wants: []string{wantStr}, depth: depth, done: true}
+		var builtOK bool
+		frame := cloneFrame(cloneKey("v2:", a.wants, a.depth), func() ([]byte, int, bool) {
+			f, n, ok := buildFetchV2(g, &a, nil)
+			builtOK = ok
+			return f, n, ok
+		})
+		if builtOK || (len(frame) > 0 && !bytes.Contains(frame, []byte("ERR "))) {
+			g.fastClone.Store(&fastCloneItem{want: want, depth: depth, v2: true, frame: frame})
+		}
+		return frame
+	}
+	return nil
 }
 
 const (
@@ -1458,7 +1734,162 @@ func decodeGitBody(body []byte, encoding string) ([]byte, error) {
 	return out, nil
 }
 
-// queryService finds the first "service=git-upload-pack" or "service=git-receive-pack" parameter, exactly as
+var okMainSidebandFrame = func() []byte {
+	var report []byte
+	report = appendPkt(report, "unpack ok\n")
+	report = appendPkt(report, "ok refs/heads/main\n")
+	report = append(report, pktFlushLine...)
+	out := appendSideband(make([]byte, 0, len(report)+16), report, 1)
+	out = append(out, pktFlushLine...)
+	return HTTPFrame(200, ctReceiveResult, GitNoCacheHeaders, out)
+}()
+
+// tryFastReceivePack handles the common single-command ref update push with zero command/map/report allocations.
+// Unusual command lists (multiple commands, deletes, shallow/push-cert lines, malformed headers) return nil so
+// receivePack handles them with full generality.
+func tryFastReceivePack(g *GitRepo, body []byte) []byte {
+	if len(body) < 91 {
+		return nil
+	}
+	length := 0
+	for k := 0; k < 4; k++ {
+		v, ok := hexNibble(body[k])
+		if !ok {
+			return nil
+		}
+		length = length<<4 | int(v)
+	}
+	if length < 87 || length+4 > len(body) {
+		return nil
+	}
+	if string(body[length:length+4]) != pktFlushLine {
+		return nil // more than one command packet or no flush
+	}
+	line := body[4:length]
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		line = line[:len(line)-1]
+	}
+	nul := bytes.IndexByte(line, 0)
+	var capBytes []byte
+	if nul >= 0 {
+		capBytes = line[nul+1:]
+		line = line[:nul]
+	}
+	if len(line) < 83 || line[40] != ' ' || line[81] != ' ' {
+		return nil
+	}
+	oldBytes, newBytes, refBytes := line[:40], line[41:81], line[82:]
+	if !isOIDBytes(oldBytes) || !isOIDBytes(newBytes) || string(newBytes) == ZeroOID {
+		return nil
+	}
+	for _, ch := range refBytes {
+		if ch <= 0x20 || ch >= 0x7f {
+			return nil
+		}
+	}
+	wantsReport, useSideband := false, false
+	for len(capBytes) > 0 {
+		tok := capBytes
+		if sp := bytes.IndexByte(capBytes, ' '); sp >= 0 {
+			tok, capBytes = capBytes[:sp], capBytes[sp+1:]
+		} else {
+			capBytes = nil
+		}
+		switch string(tok) {
+		case "report-status", "report-status-v2":
+			wantsReport = true
+		case "side-band-64k":
+			useSideband = true
+		}
+	}
+	packData := body[length+4:]
+	if len(packData) == 0 {
+		return nil
+	}
+	objects, err := ParsePack(packData, func(oid string) *GitObject {
+		g.Mu.RLock()
+		defer g.Mu.RUnlock()
+		return g.objects[oid]
+	})
+	if err != nil {
+		return nil // let general path format unpack error
+	}
+	cmd := pushCommand{oldOID: string(oldBytes), newOID: string(newBytes), ref: string(refBytes)}
+	if cmd.ref == "refs/heads/main" {
+		cmd.ref = "refs/heads/main" // intern constant string, no heap copy needed if matched
+	}
+
+	storeMu.Lock()
+	g.Mu.Lock()
+	for _, obj := range objects {
+		g.AddObject(obj)
+	}
+	linkProblem := g.missingLink(objects)
+	verdict := g.pushVerdict(cmd, "ok", linkProblem)
+	if verdict == "" {
+		hadBranches := g.hasRefWithPrefix("refs/heads/")
+		g.SetRef(cmd.ref, cmd.newOID)
+		if !hadBranches && strings.HasPrefix(cmd.ref, "refs/heads/") && !g.HasRef(g.HeadRefName()) {
+			g.DefaultBranch = cmd.ref[len("refs/heads/"):]
+		}
+	}
+	g.Mu.Unlock()
+	storeMu.Unlock()
+
+	if verdict == "" && cmd.ref == "refs/heads/main" && wantsReport && useSideband {
+		return okMainSidebandFrame
+	}
+	if !wantsReport {
+		if useSideband {
+			return HTTPFrame(200, ctReceiveResult, GitNoCacheHeaders, []byte(pktFlushLine))
+		}
+		return HTTPFrame(200, ctReceiveResult, GitNoCacheHeaders, nil)
+	}
+	var report []byte
+	report = appendPkt(report, "unpack ok\n")
+	if verdict == "" {
+		report = appendPkt(report, "ok ", cmd.ref, "\n")
+	} else {
+		report = appendPkt(report, "ng ", cmd.ref, " ", verdict, "\n")
+	}
+	report = append(report, pktFlushLine...)
+	if !useSideband {
+		return HTTPFrame(200, ctReceiveResult, GitNoCacheHeaders, report)
+	}
+	out := appendSideband(make([]byte, 0, len(report)+16), report, 1)
+	out = append(out, pktFlushLine...)
+	return HTTPFrame(200, ctReceiveResult, GitNoCacheHeaders, out)
+}
+
+func queryServiceBytes(query []byte) string {
+	for {
+		part, rest, more := bytes.Cut(query, []byte("&"))
+		switch string(part) {
+		case "service=git-upload-pack":
+			return "git-upload-pack"
+		case "service=git-receive-pack":
+			return "git-receive-pack"
+		}
+		if !more {
+			return ""
+		}
+		query = rest
+	}
+}
+
+func wantsV2Bytes(header []byte) bool {
+	for len(header) > 0 {
+		part, rest, more := bytes.Cut(header, []byte(":"))
+		if string(part) == "version=2" {
+			return true
+		}
+		if !more {
+			return false
+		}
+		header = rest
+	}
+	return false
+}
 // /(?:^|&)service=(git-upload-pack|git-receive-pack)(?:&|$)/ does; "" when there is none.
 func queryService(query string) string {
 	for {

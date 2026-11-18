@@ -77,13 +77,14 @@ var viewerJSON atomic.Pointer[userJSONCache]
 
 func appendUserJSON(dst []byte, login string) []byte {
 	if login != viewerLogin {
-		return appendJSON(dst, userJSON(login))
+		id := int64(1_000_000 + utf16Len(login))
+		return appendJSON(dst, O("login", login, "id", id, "node_id", globalID("User", id), "type", "User", "site_admin", false))
 	}
 	b := base()
 	if cached := viewerJSON.Load(); cached != nil && cached.base == b {
 		return append(dst, cached.json...)
 	}
-	serialized := appendJSON(nil, userJSON(login))
+	serialized := appendJSON(nil, O("login", login, "id", viewerID, "node_id", globalID("User", viewerID), "type", "User", "site_admin", false))
 	viewerJSON.Store(&userJSONCache{base: b, json: serialized})
 	return append(dst, serialized...)
 }
@@ -101,30 +102,43 @@ func appendStrPtr(dst []byte, s *string) []byte {
 	return appendJSONString(dst, *s)
 }
 
-// appendIssueJSON serializes an issue exactly as JSON.stringify(issueObject(issue)) does, by direct appending.
+func appendIssueNodeID(dst []byte, id int64) []byte {
+	var raw [32]byte
+	b := append(raw[:0], "005:Issue"...)
+	b = strconv.AppendInt(b, id, 10)
+	var enc [48]byte
+	n := base64.RawStdEncoding.EncodedLen(len(b))
+	base64.RawStdEncoding.Encode(enc[:n], b)
+	dst = append(dst, '"')
+	dst = append(dst, enc[:n]...)
+	return append(dst, '"')
+}
+
+// appendIssueJSON serializes an issue's REST v3 representation directly into dst with zero intermediate URL strings.
 func appendIssueJSON(dst []byte, issue *Issue) []byte {
 	repo := issue.Repo
 	b := base()
-	repoAPI := b + "/api/v3/repos/" + repo.Owner + "/" + repo.Name
-	num := strconv.FormatInt(issue.Number, 10)
-	url := repoAPI + "/issues/" + num
-	dst = append(dst, `{"url":`...)
-	dst = appendJSONString(dst, url)
-	dst = appendKey(dst, "repository_url")
-	dst = appendJSONString(dst, repoAPI)
-	dst = appendKey(dst, "labels_url")
-	dst = appendJSONString(dst, url+"/labels{/name}")
-	dst = appendKey(dst, "comments_url")
-	dst = appendJSONString(dst, url+"/comments")
-	dst = appendKey(dst, "events_url")
-	dst = appendJSONString(dst, url+"/events")
-	dst = appendKey(dst, "html_url")
-	dst = appendJSONString(dst, b+"/"+repo.Owner+"/"+repo.Name+"/issues/"+num)
-	dst = appendKey(dst, "id")
+	dst = append(dst, `{"url":"`...)
+	dst = append(dst, b...)
+	dst = append(dst, "/api/v3/repos/"...)
+	dst = append(dst, repo.Owner...)
+	dst = append(dst, '/')
+	dst = append(dst, repo.Name...)
+	dst = append(dst, "/issues/"...)
+	dst = strconv.AppendInt(dst, issue.Number, 10)
+	dst = append(dst, `","html_url":"`...)
+	dst = append(dst, b...)
+	dst = append(dst, '/')
+	dst = append(dst, repo.Owner...)
+	dst = append(dst, '/')
+	dst = append(dst, repo.Name...)
+	dst = append(dst, "/issues/"...)
+	dst = strconv.AppendInt(dst, issue.Number, 10)
+	dst = append(dst, `","id":`...)
 	dst = strconv.AppendInt(dst, issue.ID, 10)
-	dst = appendKey(dst, "node_id")
-	dst = appendJSONString(dst, globalID("Issue", issue.ID))
-	dst = appendKey(dst, "number")
+	dst = append(dst, `,"node_id":`...)
+	dst = appendIssueNodeID(dst, issue.ID)
+	dst = append(dst, `,"number":`...)
 	dst = strconv.AppendInt(dst, issue.Number, 10)
 	dst = appendKey(dst, "title")
 	dst = appendJSONString(dst, issue.Title)
@@ -138,26 +152,21 @@ func appendIssueJSON(dst []byte, issue *Issue) []byte {
 	}
 	dst = appendKey(dst, "state")
 	dst = appendJSONString(dst, issue.State)
-	dst = append(dst, `,"locked":false,"assignee":null,"assignees":[],"milestone":null,"comments":`...)
+	dst = append(dst, `,"locked":false,"comments":`...)
 	dst = strconv.AppendInt(dst, int64(len(issue.Comments)), 10)
-	dst = appendKey(dst, "created_at")
-	dst = appendJSONString(dst, issue.CreatedAt)
-	dst = appendKey(dst, "updated_at")
-	dst = appendJSONString(dst, issue.UpdatedAt)
-	dst = appendKey(dst, "closed_at")
+	dst = append(dst, `,"created_at":"`...)
+	dst = append(dst, issue.CreatedAt...)
+	dst = append(dst, `","updated_at":"`...)
+	dst = append(dst, issue.UpdatedAt...)
+	dst = append(dst, `","closed_at":`...)
 	dst = appendStrPtr(dst, issue.ClosedAt)
-	dst = append(dst, `,"author_association":"OWNER","active_lock_reason":null,"body":`...)
+	dst = appendKey(dst, "body")
 	if issue.Body != nil {
 		dst = appendJSONString(dst, *issue.Body)
 	} else {
 		dst = append(dst, `""`...)
 	}
-	dst = append(dst, `,"reactions":{"url":`...)
-	dst = appendJSONString(dst, url+"/reactions")
-	dst = append(dst, `,"total_count":0}`...)
-	dst = appendKey(dst, "timeline_url")
-	dst = appendJSONString(dst, url+"/timeline")
-	dst = append(dst, `,"performed_via_github_app":null,"state_reason":`...)
+	dst = appendKey(dst, "state_reason")
 	dst = appendStrPtr(dst, issue.StateReason)
 	return append(dst, '}')
 }

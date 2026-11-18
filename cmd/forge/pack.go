@@ -212,6 +212,13 @@ type packParser struct {
 // digestPool recycles the SHA-1 state ParsePack hashes object ids with.
 var digestPool = sync.Pool{New: func() any { return sha1.New() }}
 
+var parserPool = sync.Pool{New: func() any {
+	return &packParser{
+		objects: make([]*GitObject, 0, 16),
+		offsets: make([]int, 0, 16),
+	}
+}}
+
 func badZlib(start int, err error) error {
 	return PackError("bad zlib stream at " + strconv.Itoa(start) + ": " + err.Error())
 }
@@ -323,16 +330,43 @@ func ParsePack(buf []byte, external func(oid string) *GitObject) ([]*GitObject, 
 
 	// Every entry takes at least ~10 bytes, which bounds how much to presize for a lying count.
 	hint := int(min(uint64(count), uint64(end/10)+1))
-	p := &packParser{
-		data:    buf[:end],
-		inf:     inflaterPool.Get().(*inflater),
-		digest:  digestPool.Get().(hash.Hash),
-		objects: make([]*GitObject, 0, hint),
-		offsets: make([]int, 0, hint),
+	p := parserPool.Get().(*packParser)
+	p.data = buf[:end]
+	p.inf = inflaterPool.Get().(*inflater)
+	p.digest = digestPool.Get().(hash.Hash)
+	if cap(p.objects) < hint {
+		p.objects = make([]*GitObject, 0, hint)
+		p.offsets = make([]int, 0, hint)
+	} else {
+		p.objects = p.objects[:0]
+		p.offsets = p.offsets[:0]
 	}
-	defer p.inf.release()
-	defer digestPool.Put(p.digest)
+	p.inPack = nil
+	defer func() {
+		p.inf.release()
+		digestPool.Put(p.digest)
+		clear(p.objects)
+		p.data = nil
+		p.inf = nil
+		p.digest = nil
+		p.inPack = nil
+		if cap(p.scratch) > 4<<20 {
+			p.scratch = nil
+		}
+		if cap(p.objects) > 4096 {
+			p.objects = nil
+			p.offsets = nil
+		}
+		parserPool.Put(p)
+	}()
 	lookup := func(oid string) *GitObject { return p.byID(oid, external) }
+
+	// Copy the compressed body once so every non-delta object keeps its exact verified zlib stream without
+	// pinning the whole HTTP request buffer or re-deflating on fetch/clone.
+	var zSlab []byte
+	if end > 12 {
+		zSlab = bytes.Clone(buf[12:end])
+	}
 
 	var pending []pendingRefDelta
 	pos := 12
@@ -395,11 +429,17 @@ func ParsePack(buf []byte, external func(oid string) *GitObject) ([]*GitObject, 
 		}
 		var err error
 		if typeCode <= 4 {
+			zlibStart := pos
 			data := make([]byte, int(size))
 			if pos, err = p.inflate(pos, start, data); err != nil {
 				return nil, err
 			}
-			p.remember(start, p.object(ObjType(typeCode), data))
+			obj := p.object(ObjType(typeCode), data)
+			if zSlab != nil && pos >= zlibStart {
+				z := zSlab[zlibStart-12 : pos-12 : pos-12]
+				obj.deflated.Store(&z)
+			}
+			p.remember(start, obj)
 			continue
 		}
 		delta := p.scratchOf(int(size))
@@ -444,7 +484,9 @@ func ParsePack(buf []byte, external func(oid string) *GitObject) ([]*GitObject, 
 		}
 		pending = next
 	}
-	return p.objects, nil
+	out := make([]*GitObject, len(p.objects))
+	copy(out, p.objects)
+	return out, nil
 }
 
 // ---------------------------------------------------------------- writing

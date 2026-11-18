@@ -20,6 +20,20 @@ import (
 	"sync/atomic"
 )
 
+type gitRefFrames struct {
+	version       uint64
+	uploadAdvert  []byte
+	receiveAdvert []byte
+	lsRefsPlain   [8][]byte // indexed by peel(4) | symrefs(2) | unborn(1) when no ref-prefix is given
+}
+
+type fastCloneItem struct {
+	want  [40]byte
+	depth int64
+	v2    bool
+	frame []byte
+}
+
 // GitRepo is the git half of a repository: the object store, the refs and the per-refs-version protocol cache.
 // The store's Repo embeds it, so these methods are promoted onto Repo.
 type GitRepo struct {
@@ -34,7 +48,10 @@ type GitRepo struct {
 	refs    map[string]string
 	sorted  atomic.Pointer[refSnapshot]
 
-	// Pre-rendered HTTP responses (advertisements, ls-refs) valid for one RefsVersion; see cachedFrame.
+	refFrames atomic.Pointer[gitRefFrames]
+	fastClone atomic.Pointer[fastCloneItem]
+
+	// Pre-rendered HTTP responses (ls-refs with prefixes, etc.) valid for one RefsVersion; see cachedFrame.
 	cacheMu      sync.Mutex
 	cacheVersion uint64
 	cache        map[string][]byte
@@ -61,12 +78,14 @@ func NewGitRepo(defaultBranch string) *GitRepo {
 // InitGit initializes an embedded GitRepo in place (refsVersion 1, as a new repository starts).
 func (g *GitRepo) InitGit(defaultBranch string) {
 	g.DefaultBranch = defaultBranch
-	g.RefsVersion = 1
+	atomic.StoreUint64(&g.RefsVersion, 1)
 	g.PushedAt = 0
 	g.objects = make(map[string]*GitObject)
 	g.order = nil
 	g.refs = make(map[string]string)
 	g.sorted.Store(nil)
+	g.refFrames.Store(nil)
+	g.fastClone.Store(nil)
 	g.cache = nil
 	g.cacheVersion = 0
 }
@@ -126,7 +145,7 @@ func (g *GitRepo) RefCount() int {
 // SetRef points name at oid, bumps RefsVersion and stamps PushedAt with the next logical time.
 func (g *GitRepo) SetRef(name, oid string) {
 	g.refs[name] = oid
-	g.RefsVersion++
+	atomic.AddUint64(&g.RefsVersion, 1)
 	g.PushedAt = NextTime()
 }
 
@@ -136,14 +155,15 @@ func (g *GitRepo) DeleteRef(name string) bool {
 		return false
 	}
 	delete(g.refs, name)
-	g.RefsVersion++
+	atomic.AddUint64(&g.RefsVersion, 1)
 	g.PushedAt = NextTime()
 	return true
 }
 
 // sortedRefs is every ref sorted by name, rebuilt once per RefsVersion (safe under RLock: the snapshot is atomic).
 func (g *GitRepo) sortedRefs() []Ref {
-	if s := g.sorted.Load(); s != nil && s.version == g.RefsVersion {
+	ver := atomic.LoadUint64(&g.RefsVersion)
+	if s := g.sorted.Load(); s != nil && s.version == ver {
 		return s.refs
 	}
 	refs := make([]Ref, 0, len(g.refs))
@@ -151,7 +171,7 @@ func (g *GitRepo) sortedRefs() []Ref {
 		refs = append(refs, Ref{Name: name, OID: oid})
 	}
 	slices.SortFunc(refs, func(a, b Ref) int { return strings.Compare(a.Name, b.Name) })
-	g.sorted.Store(&refSnapshot{version: g.RefsVersion, refs: refs})
+	g.sorted.Store(&refSnapshot{version: ver, refs: refs})
 	return refs
 }
 

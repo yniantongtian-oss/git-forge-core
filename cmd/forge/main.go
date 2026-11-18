@@ -142,14 +142,12 @@ func main() {
 		os.Exit(0)
 	}()
 
-	ln, err := net.Listen("tcp4", "0.0.0.0:0")
+	port, stopServer, err := startServer()
 	if err != nil {
 		os.Stderr.WriteString("[forge] " + err.Error() + "\n")
 		os.Exit(1)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
 	os.Stdout.WriteString("[forge] listening on port " + strconv.Itoa(port) + "\n")
-	go serveHTTP(ln)
 
 	if err := register(env, port); err != nil {
 		os.Stderr.WriteString("[forge] " + err.Error() + "\n")
@@ -157,7 +155,7 @@ func main() {
 	}
 	os.Stdout.WriteString("[forge] registered; waiting for the env to say done\n")
 	waitForDone(env)
-	ln.Close()
+	stopServer()
 	os.Stdout.WriteString("[forge] done\n")
 	os.Exit(0)
 }
