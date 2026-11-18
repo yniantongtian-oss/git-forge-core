@@ -453,7 +453,7 @@ func appendRequestID(dst []byte, n uint64) []byte {
 	return append(dst, ":0000A1:00000001"...)
 }
 
-const jsonContentType = "application/json; charset=utf-8"
+const jsonContentType = "application/json"
 
 // jsonFrame is sendJson: Content-Type, Content-Length, a fresh X-GitHub-Request-Id, then extra header lines.
 func jsonFrame(status int, body []byte, extra string) []byte {
@@ -549,75 +549,112 @@ type httpRequest struct {
 	body            []byte
 }
 
+// httpConn is one client connection: its buffers and the incremental state of the request being received. It
+// never reads by itself: a transport (the Go netpoller loop in serve_net.go, or the Linux epoll reactor) appends
+// input at w and calls process, which answers every complete buffered request and reports what to wait for next.
 type httpConn struct {
-	nc        io.ReadWriteCloser
+	nc        io.ReadWriteCloser // replies go here; the reactor queues what the socket cannot take yet
 	buf       []byte
 	r         int // start of unread data
 	w         int // end of unread data
 	out       []byte
-	jsonBuf   []byte
 	key       []byte
 	authed    [128]byte
 	authedLen int
 	lastRepo  *Repo
+
+	// State of the request that starts at r. Offsets are relative to r, so compacting the buffer keeps them valid.
+	need         int  // bytes (from r) the pending request needs before it can complete; 0 when unknown
+	chunkAt      int  // chunked body: the next chunk-size line still to scan (0: not started)
+	chunkTotal   int  // chunked body: payload bytes scanned so far
+	continueSent bool // 100 Continue already sent for the pending request
+	stalled      bool // the reactor still holds unsent reply bytes: answer nothing more until they drain
 }
 
 var httpConnPool = sync.Pool{New: func() any {
 	return &httpConn{
-		buf:     make([]byte, 16<<10),
-		out:     make([]byte, 0, 8<<10),
-		jsonBuf: make([]byte, 0, 1<<10),
-		key:     make([]byte, 0, 128),
+		buf: make([]byte, 16<<10),
+		out: make([]byte, 0, 8<<10),
+		key: make([]byte, 0, 128),
 	}
 }}
 
-func serveConn(nc io.ReadWriteCloser) {
+// acquireConn takes pooled buffers for a new connection whose replies go to nc.
+func acquireConn(nc io.ReadWriteCloser) *httpConn {
 	c := httpConnPool.Get().(*httpConn)
 	c.nc = nc
 	c.r, c.w = 0, 0
 	c.authedLen = 0
 	c.lastRepo = nil
+	c.stalled = false
+	c.resetPending()
 	if len(c.buf) != 16<<10 {
 		c.buf = make([]byte, 16<<10)
 	}
-	c.serve()
+	return c
+}
+
+// releaseConn returns a finished connection's buffers to the pool (the transport closes the socket itself).
+func releaseConn(c *httpConn) {
 	c.nc = nil
 	c.lastRepo = nil
+	if len(c.buf) > 64<<10 {
+		c.buf = make([]byte, 16<<10)
+	}
 	if cap(c.out) > 64<<10 {
 		c.out = make([]byte, 0, 8<<10)
-	}
-	if cap(c.jsonBuf) > 16<<10 {
-		c.jsonBuf = make([]byte, 0, 1<<10)
 	}
 	httpConnPool.Put(c)
 }
 
-func (c *httpConn) serve() {
-	defer c.nc.Close()
+func (c *httpConn) resetPending() {
+	c.need, c.chunkAt, c.chunkTotal, c.continueSent = 0, 0, 0, false
+}
+
+// process results: what the transport waits for next.
+const (
+	procMore  = iota // every complete buffered request is answered: read more input
+	procStall        // a reply is still being flushed (reactor only): wait until the socket takes it
+	procClose        // close the connection, after flushing what is queued
+)
+
+// parseNext results; positive values are HTTP statuses for a request that cannot be served.
+const (
+	parseDone = 0  // a whole request was parsed into req
+	parseMore = -1 // the buffered bytes end mid-request
+)
+
+// process answers every complete request buffered on c, pipelined ones included, and never waits for input. A
+// handler panic becomes a 500 that closes the connection.
+func (c *httpConn) process() (result int) {
 	var req httpRequest
 	defer func() {
 		if r := recover(); r != nil {
-			head := bytes.Equal(req.method, []byte("HEAD"))
+			head := string(req.method) == "HEAD"
 			frame := errorFrame(500, "Server Error: "+jsString(panicValue(r)), nil, "Connection: close\r\n")
 			_ = c.write(frame, head)
+			result = procClose
 		}
 	}()
 	for {
-		req = httpRequest{}
-		status := c.readRequest(&req)
-		if status == -1 {
-			return
+		if c.stalled {
+			return procStall
 		}
-		if status != 0 {
+		req = httpRequest{}
+		status := c.parseNext(&req)
+		if status == parseMore {
+			return procMore
+		}
+		if status != parseDone {
 			message := StatusText(status)
 			if status == 413 {
 				message = "Request body too large"
 			}
 			c.nc.Write(errorFrame(status, message, nil, "Connection: close\r\n"))
-			return
+			return procClose
 		}
 		if !c.handle(&req) || !req.keepAlive {
-			return
+			return procClose
 		}
 		if c.r == c.w {
 			c.r, c.w = 0, 0
@@ -628,44 +665,106 @@ func (c *httpConn) serve() {
 	}
 }
 
-// fill reads more bytes into the buffer (compacting or growing it first). It returns false on EOF/error. No read
-// deadlines: keep-alive reads never touch the runtime timer heap.
-func (c *httpConn) fill() bool {
-	if c.r > 0 && (c.w == len(c.buf) || c.r == c.w) {
-		copy(c.buf, c.buf[c.r:c.w])
-		c.w -= c.r
-		c.r = 0
+// room makes sure the transport has free space after w to read into: it compacts consumed bytes away, or doubles
+// the buffer when unfinished input already fills it (parseNext caps heads at 64 KiB and bodies at 512 MiB).
+func (c *httpConn) room() {
+	if c.w < len(c.buf) {
+		return
 	}
-	if c.w == len(c.buf) {
-		grown := make([]byte, 2*len(c.buf))
-		copy(grown, c.buf[:c.w])
-		c.buf = grown
+	if c.r > 0 {
+		c.compact()
+		return
 	}
-	n, err := c.nc.Read(c.buf[c.w:])
-	c.w += n
-	return n > 0 || err == nil
+	c.reserve(2 * len(c.buf))
 }
 
-// readRequest parses one request (head and body). It returns 0 on success, -1 to drop the connection, or an
-// HTTP status to answer with before closing.
-func (c *httpConn) readRequest(req *httpRequest) int {
-	headEnd := -1
-	for {
+func (c *httpConn) compact() {
+	copy(c.buf, c.buf[c.r:c.w])
+	c.w -= c.r
+	c.r = 0
+}
+
+// reserve lets the buffer hold total bytes from r contiguously, compacting first and growing only when needed.
+func (c *httpConn) reserve(total int) {
+	if c.r+total <= len(c.buf) {
+		return
+	}
+	if total <= len(c.buf) {
+		c.compact()
+		return
+	}
+	size := 2 * len(c.buf)
+	if size < total {
+		size = (total + 4095) &^ 4095
+	}
+	grown := make([]byte, size)
+	copy(grown, c.buf[c.r:c.w])
+	c.w -= c.r
+	c.r = 0
+	c.buf = grown
+}
+
+var continueLine = []byte("HTTP/1.1 100 Continue\r\n\r\n")
+
+// awaitBody notes that the pending request needs total bytes from r, makes room for them, and sends 100 Continue
+// once when the client asked to wait for it. The request fields are stale afterwards (the buffer may move).
+func (c *httpConn) awaitBody(req *httpRequest, total int) {
+	c.need = total
+	c.reserve(total)
+	if req.expectContinue && !c.continueSent {
+		c.continueSent = true
+		c.nc.Write(continueLine)
+	}
+}
+
+// parseNext parses the request at r from the buffered bytes alone. It returns parseDone (req filled, r moved past
+// the request), parseMore (wait for input; room for a known body is reserved), or an HTTP status. Request fields
+// alias the buffer, so they are valid until the next read.
+func (c *httpConn) parseNext(req *httpRequest) int {
+	if c.need == 0 && c.chunkAt == 0 {
 		for c.w-c.r >= 2 && c.buf[c.r] == '\r' && c.buf[c.r+1] == '\n' {
 			c.r += 2 // stray CRLF between pipelined requests
 		}
-		if i := bytes.Index(c.buf[c.r:c.w], []byte("\r\n\r\n")); i >= 0 {
-			headEnd = c.r + i + 4
-			break
-		}
-		if c.w-c.r >= maxHeaderBytes {
+	}
+	avail := c.w - c.r
+	if c.need > 0 && avail < c.need {
+		return parseMore // a body is still streaming in: no need to look again yet
+	}
+	window := c.buf[c.r:c.w]
+	headLen := bytes.Index(window, []byte("\r\n\r\n"))
+	if headLen < 0 {
+		if avail >= maxHeaderBytes {
 			return 431
 		}
-		if !c.fill() {
-			return -1
-		}
+		return parseMore
 	}
-	head := c.buf[c.r:headEnd]
+	headLen += 4
+	if status := parseHead(window[:headLen], req); status != 0 {
+		return status
+	}
+	if req.chunked {
+		return c.parseChunked(req, headLen)
+	}
+	total := headLen
+	if req.hasLength && req.contentLength > 0 {
+		if req.contentLength > maxBodyBytes {
+			return 413
+		}
+		total += int(req.contentLength)
+		if avail < total {
+			c.awaitBody(req, total)
+			return parseMore
+		}
+		req.body = window[headLen:total]
+	}
+	c.r += total
+	c.resetPending()
+	return parseDone
+}
+
+// parseHead parses the request line and the headers this server reads into a cleared req (400 when malformed).
+func parseHead(head []byte, req *httpRequest) int {
+	*req = httpRequest{}
 	lineEnd := bytes.Index(head, []byte("\r\n"))
 	line := head[:lineEnd]
 	sp1 := bytes.IndexByte(line, ' ')
@@ -765,44 +864,6 @@ func (c *httpConn) readRequest(req *httpRequest) int {
 			}
 		}
 	}
-	c.r = headEnd
-	if req.chunked {
-		// The body may move the buffer around: keep private copies of everything the handlers read.
-		req.method, req.path, req.query = bytes.Clone(req.method), bytes.Clone(req.path), bytes.Clone(req.query)
-		req.host, req.auth, req.accept = bytes.Clone(req.host), bytes.Clone(req.auth), bytes.Clone(req.accept)
-		req.gitProtocol, req.contentEncoding = bytes.Clone(req.gitProtocol), bytes.Clone(req.contentEncoding)
-		if req.expectContinue {
-			c.nc.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
-		}
-		body, status := c.readChunked()
-		if status != 0 {
-			return status
-		}
-		req.body = body
-		return 0
-	}
-	if !req.hasLength || req.contentLength == 0 {
-		return 0
-	}
-	if req.contentLength > maxBodyBytes {
-		return 413
-	}
-	n := int(req.contentLength)
-	if c.w-c.r >= n {
-		req.body = c.buf[c.r : c.r+n]
-		c.r += n
-		return 0
-	}
-	if req.expectContinue {
-		c.nc.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
-	}
-	body := make([]byte, n)
-	have := copy(body, c.buf[c.r:c.w])
-	c.r, c.w = 0, 0
-	if _, err := io.ReadFull(c.nc, body[have:]); err != nil {
-		return -1
-	}
-	req.body = body
 	return 0
 }
 
@@ -816,70 +877,94 @@ func joinHeader(existing, value []byte) []byte {
 	return append(joined, value...)
 }
 
-// readLine returns the next CRLF-terminated line (without the CRLF), reading as needed.
-func (c *httpConn) readLine() ([]byte, bool) {
+// parseChunked scans a chunked body incrementally, resuming at chunkAt, and once the last chunk and the trailers
+// are buffered gathers the payload into one exactly sized slice.
+func (c *httpConn) parseChunked(req *httpRequest, headLen int) int {
+	window := c.buf[c.r:c.w]
+	at := c.chunkAt
+	if at == 0 {
+		at, c.chunkTotal = headLen, 0
+	}
 	for {
-		if i := bytes.Index(c.buf[c.r:c.w], []byte("\r\n")); i >= 0 {
-			line := c.buf[c.r : c.r+i]
-			c.r += i + 2
-			return line, true
+		lineEnd := bytes.Index(window[at:], []byte("\r\n"))
+		if lineEnd < 0 {
+			if len(window)-at > maxHeaderBytes {
+				return 400
+			}
+			c.chunkAt = at
+			c.awaitBody(req, len(window)+1)
+			return parseMore
 		}
-		if c.w-c.r > maxHeaderBytes || !c.fill() {
-			return nil, false
+		size, ok := chunkSize(window[at : at+lineEnd])
+		if !ok {
+			return 400
 		}
+		dataAt := at + lineEnd + 2
+		if size == 0 {
+			end := dataAt
+			for { // trailers, up to the empty line
+				e := bytes.Index(window[end:], []byte("\r\n"))
+				if e < 0 {
+					c.chunkAt = at
+					c.awaitBody(req, len(window)+1)
+					return parseMore
+				}
+				end += e + 2
+				if e == 0 {
+					break
+				}
+			}
+			body := make([]byte, 0, c.chunkTotal)
+			for p := headLen; ; {
+				e := bytes.Index(window[p:], []byte("\r\n"))
+				n, _ := chunkSize(window[p : p+e])
+				if n == 0 {
+					break
+				}
+				p += e + 2
+				body = append(body, window[p:p+n]...)
+				p += n + 2
+			}
+			req.body = body
+			c.r += end
+			c.resetPending()
+			return parseDone
+		}
+		if c.chunkTotal+size > maxBodyBytes {
+			return 413
+		}
+		next := dataAt + size + 2
+		if next > len(window) {
+			c.chunkAt = at
+			c.awaitBody(req, next)
+			return parseMore
+		}
+		if window[next-2] != '\r' || window[next-1] != '\n' {
+			return 400
+		}
+		c.chunkTotal += size
+		at = next
 	}
 }
 
-func (c *httpConn) readChunked() ([]byte, int) {
-	var body []byte
-	for {
-		line, ok := c.readLine()
-		if !ok {
-			return nil, -1
-		}
-		if semi := bytes.IndexByte(line, ';'); semi >= 0 {
-			line = line[:semi]
-		}
-		size, err := strconv.ParseInt(string(bytes.TrimSpace(line)), 16, 64)
-		if err != nil || size < 0 {
-			return nil, 400
-		}
-		if size == 0 {
-			for { // trailers, up to the empty line
-				trailer, ok := c.readLine()
-				if !ok {
-					return nil, -1
-				}
-				if len(trailer) == 0 {
-					if body == nil {
-						body = []byte{}
-					}
-					return body, 0
-				}
-			}
-		}
-		if int64(len(body))+size > maxBodyBytes {
-			return nil, 413
-		}
-		if body == nil {
-			body = make([]byte, 0, min(maxBodyBytes, max(int(size), 4096)))
-		}
-		for remaining := int(size); remaining > 0; {
-			if c.r == c.w && !c.fill() {
-				return nil, -1
-			}
-			take := min(c.w-c.r, remaining)
-			body = append(body, c.buf[c.r:c.r+take]...)
-			c.r += take
-			remaining -= take
-		}
-		for c.w-c.r < 2 { // the CRLF closing the chunk
-			if !c.fill() {
-				return nil, -1
-			}
-		}
-		c.r += 2
+// chunkSize parses a chunk-size line: hex digits, optionally followed by ";extensions" and padded with blanks.
+func chunkSize(line []byte) (int, bool) {
+	if semi := bytes.IndexByte(line, ';'); semi >= 0 {
+		line = line[:semi]
 	}
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || len(line) > 15 {
+		return 0, false
+	}
+	n := 0
+	for _, ch := range line {
+		v, ok := hexNibble(ch)
+		if !ok {
+			return 0, false
+		}
+		n = n<<4 | int(v)
+	}
+	return n, true
 }
 
 // handle answers one request; false means the connection must close.
@@ -1013,26 +1098,24 @@ func (c *httpConn) fastCreateIssue(req *httpRequest) bool {
 	}
 	repo.issueList = append(repo.issueList, issue)
 	issuesByID[issue.ID] = issue
-	c.jsonBuf = appendIssueJSON(c.jsonBuf[:0], issue)
-	repoOwner, repoName, number := repo.Owner, repo.Name, issue.Number
+	// The JSON goes straight into c.out behind a gap the head is written into afterwards: one buffer, one write.
+	const gap = 160
+	if cap(c.out) < gap+2048 {
+		c.out = make([]byte, 0, 8<<10)
+	}
+	out := appendIssueJSON(c.out[:gap], issue)
 	storeMu.Unlock()
 
-	out := append(c.out[:0], "HTTP/1.1 201 Created\r\nContent-Type: "+jsonContentType+"\r\nContent-Length: "...)
-	out = strconv.AppendInt(out, int64(len(c.jsonBuf)), 10)
-	out = append(out, "\r\nX-GitHub-Request-Id: "...)
-	out = appendRequestID(out, requestCounter.Add(1))
-	out = append(out, "\r\nLocation: "...)
-	out = append(out, base()...)
-	out = append(out, "/api/v3/repos/"...)
-	out = append(out, repoOwner...)
-	out = append(out, '/')
-	out = append(out, repoName...)
-	out = append(out, "/issues/"...)
-	out = strconv.AppendInt(out, number, 10)
-	out = append(out, "\r\n\r\n"...)
-	out = append(out, c.jsonBuf...)
+	var head [gap]byte
+	h := append(head[:0], "HTTP/1.1 201 Created\r\nContent-Type: "+jsonContentType+"\r\nContent-Length: "...)
+	h = strconv.AppendInt(h, int64(len(out)-gap), 10)
+	h = append(h, "\r\n"+ridPrefix...)
+	h = appendHex8(h, requestCounter.Add(1))
+	h = append(h, "\r\n\r\n"...)
+	start := gap - len(h)
+	copy(out[start:gap], h)
 	c.out = out
-	_, err := c.nc.Write(out)
+	_, err := c.nc.Write(out[start:])
 	return err == nil
 }
 

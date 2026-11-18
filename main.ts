@@ -30,6 +30,10 @@ const BINARY = join(HERE, process.platform === 'win32' ? 'forge-win.exe' : 'forg
 const env: NodeJS.ProcessEnv = { ...process.env };
 env.GOGC ??= '800';
 env.GOMEMLIMIT ??= '700MiB';
+// Two Ps for the pod's two vCPUs: the epoll reactor keeps its P through short epoll_wait calls (sysmon does not
+// retake a syscall P while another P is idle), so sysmon backs off instead of waking every 20 us, and the /done
+// poller and GC run on the second P. Only the reactor thread serves requests either way.
+env.GOMAXPROCS ??= '2';
 
 let child: ChildProcess | null = null;
 

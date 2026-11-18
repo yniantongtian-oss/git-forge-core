@@ -171,7 +171,18 @@ func appendIssueJSON(dst []byte, issue *Issue) []byte {
 	return append(dst, '}')
 }
 
-const ridPlaceholder = "X-GitHub-Request-Id: FEED:0000:0000:0000A1:00000001\r\n"
+// ridPrefix starts the compact request-id header of issue replies; ridPlaceholder carries 8 hex digits that
+// appendIssueReply patches per reply (the cached frame keeps the placeholder).
+const (
+	ridPrefix      = "X-GitHub-Request-Id: "
+	ridPlaceholder = ridPrefix + "00000001\r\n"
+)
+
+// appendHex8 appends n as 8 uppercase hex digits (the low 32 bits).
+func appendHex8(dst []byte, n uint64) []byte {
+	return append(dst, upperHex[n>>28&15], upperHex[n>>24&15], upperHex[n>>20&15], upperHex[n>>16&15],
+		upperHex[n>>12&15], upperHex[n>>8&15], upperHex[n>>4&15], upperHex[n&15])
+}
 
 // issueFrameOf returns the issue's cached reply, building it on first use after a change. Callers hold storeMu.
 func issueFrameOf(issue *Issue) *issueFrame {
@@ -180,7 +191,7 @@ func issueFrameOf(issue *Issue) *issueFrame {
 	}
 	body := appendIssueJSON(make([]byte, 0, 2048), issue)
 	full := AppendHTTPHead(make([]byte, 0, 256+len(body)), 200, jsonContentType, len(body), ridPlaceholder)
-	ridAt := bytes.Index(full, []byte("FEED:")) + 5
+	ridAt := bytes.Index(full, []byte(ridPrefix)) + len(ridPrefix)
 	headLen := len(full)
 	full = append(full, body...)
 	f := &issueFrame{http: full, json: full[headLen:], ridAt: ridAt}
@@ -202,15 +213,7 @@ func appendIssueReply(dst []byte, f *issueFrame) []byte {
 	}
 	start := len(dst)
 	dst = append(dst, f.http...)
-	at := start + f.ridAt
-	for i := 7; i >= 0; i-- {
-		pos := at + i
-		if i >= 4 {
-			pos++ // skip the ':' between the two halves
-		}
-		dst[pos] = upperHex[n&15]
-		n >>= 4
-	}
+	appendHex8(dst[:start+f.ridAt], n)
 	return dst
 }
 

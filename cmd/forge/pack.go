@@ -4,20 +4,23 @@ package main
 // repository's own objects), trailer verification, and pack assembly from lazily deflated, cached streams.
 //
 // Speed:
-//   - Parsing reuses ONE pooled zlib reader per pack (zlib.Resetter.Reset per entry). It reads straight from the
-//     request buffer through an io.ByteReader, so flate consumes exactly the entry's compressed bytes (no bufio
-//     read-ahead) and the read position is the next entry's offset. Delta payloads inflate into one reusable
-//     scratch buffer and object ids reuse one SHA-1 digest.
-//   - Nothing is deflated at ingest. Writing a pack compresses only objects never served before (pooled zlib
-//     writers, level 1, fanned out over GOMAXPROCS for big batches) and caches each stream on its object, so
-//     every later pack carrying it is plain concatenation plus one SHA-1 pass.
+//   - Parsing reuses ONE pooled raw-deflate reader per pack (flate.Resetter.Reset per entry); the zlib header and
+//     Adler-32 trailer are checked directly. It reads straight from the request buffer through an io.ByteReader,
+//     so flate consumes exactly the entry's compressed bytes (no bufio read-ahead) and the read position is the
+//     trailer's offset. Delta payloads inflate into one reusable scratch buffer; object ids reuse one SHA-1 digest.
+//   - A whole (non-delta) object received by push keeps its verified zlib stream, so serving it costs no deflate.
+//     Writing a pack compresses only objects without one (pooled zlib writers, level 1, fanned out over
+//     GOMAXPROCS for big batches) and caches each stream on its object: later packs are concatenation plus SHA-1.
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"hash"
+	"hash/adler32"
 	"io"
 	"math/bits"
 	"runtime"
@@ -163,26 +166,41 @@ func (s *packSource) ReadByte() (byte, error) {
 	return b, nil
 }
 
-// inflater bundles a zlib reader with the source it reads, so the pooled pair never pins a finished pack.
+// inflater bundles a raw-deflate reader with the source it reads, so the pooled pair never pins a finished pack.
+// The 2-byte zlib header and the Adler-32 trailer are checked here directly: compress/zlib would allocate a fresh
+// Adler-32 state for every object and hash the output incrementally through an interface.
 type inflater struct {
 	src packSource
-	zr  io.ReadCloser
+	fr  io.ReadCloser // a compress/flate reader, Reset for every stream
 }
 
 var inflaterPool = sync.Pool{New: func() any { return new(inflater) }}
 
-// reset points the reader at the zlib stream starting at buf[pos] and reads its header.
+var (
+	errZlibHeader     = errors.New("zlib: invalid header")
+	errZlibDictionary = errors.New("zlib: invalid dictionary")
+	errZlibChecksum   = errors.New("zlib: invalid checksum")
+)
+
+// reset validates the RFC 1950 header at buf[pos] (deflate, window <= 32 KiB, FCHECK, no preset dictionary) and
+// points the raw-deflate reader just past it.
 func (f *inflater) reset(buf []byte, pos int) error {
-	f.src.buf, f.src.pos = buf, pos
-	if f.zr == nil {
-		zr, err := zlib.NewReader(&f.src)
-		if err != nil {
-			return err
-		}
-		f.zr = zr
+	if pos+2 > len(buf) {
+		return io.ErrUnexpectedEOF
+	}
+	cmf, flg := buf[pos], buf[pos+1]
+	if cmf&0x0f != 8 || cmf>>4 > 7 || (uint16(cmf)<<8|uint16(flg))%31 != 0 {
+		return errZlibHeader
+	}
+	if flg&0x20 != 0 {
+		return errZlibDictionary
+	}
+	f.src.buf, f.src.pos = buf, pos+2
+	if f.fr == nil {
+		f.fr = flate.NewReader(&f.src)
 		return nil
 	}
-	return f.zr.(zlib.Resetter).Reset(&f.src, nil)
+	return f.fr.(flate.Resetter).Reset(&f.src, nil)
 }
 
 func (f *inflater) release() {
@@ -223,41 +241,49 @@ func badZlib(start int, err error) error {
 	return PackError("bad zlib stream at " + strconv.Itoa(start) + ": " + err.Error())
 }
 
-// inflate decompresses the zlib stream at p.data[pos:] into out, which must come out exactly full, and returns
-// the offset just past the stream.
+// inflate decompresses the zlib stream at p.data[pos:] into out, which must come out exactly full, verifies its
+// Adler-32 trailer in one pass over out, and returns the offset just past the stream.
 func (p *packParser) inflate(pos, start int, out []byte) (int, error) {
 	if err := p.inf.reset(p.data, pos); err != nil {
 		return 0, badZlib(start, err)
 	}
-	zr := p.inf.zr
-	filled := 0
+	fr := p.inf.fr
+	filled, ended := 0, false
 	for filled < len(out) {
-		n, err := zr.Read(out[filled:])
+		n, err := fr.Read(out[filled:])
 		filled += n
 		if err == io.EOF {
 			if filled < len(out) {
 				return 0, PackError("entry at " + strconv.Itoa(start) + " inflates to " + strconv.Itoa(filled) + " bytes, header says " + strconv.Itoa(len(out)))
 			}
-			return p.inf.src.pos, nil
+			ended = true
+			break
 		}
 		if err != nil {
 			return 0, badZlib(start, err)
 		}
 	}
-	// The output is full: the stream must end here (end-of-block code, then the Adler-32 checksum).
-	var probe [1]byte
-	for {
-		n, err := zr.Read(probe[:])
+	// The output is full: the deflate stream must end right here (its end-of-block code).
+	for probe := [1]byte{}; !ended; {
+		n, err := fr.Read(probe[:])
 		if n > 0 {
 			return 0, PackError("bad zlib stream at " + strconv.Itoa(start) + ": inflates past the " + strconv.Itoa(len(out)) + " bytes its header says")
 		}
 		if err == io.EOF {
-			return p.inf.src.pos, nil
-		}
-		if err != nil {
+			ended = true
+		} else if err != nil {
 			return 0, badZlib(start, err)
 		}
 	}
+	// flate stops exactly at the end of the deflate data; the big-endian Adler-32 of the output follows.
+	end := p.inf.src.pos
+	if end+4 > len(p.data) {
+		return 0, badZlib(start, io.ErrUnexpectedEOF)
+	}
+	if adler32.Checksum(out) != binary.BigEndian.Uint32(p.data[end:]) {
+		return 0, badZlib(start, errZlibChecksum)
+	}
+	return end + 4, nil
 }
 
 func (p *packParser) scratchOf(n int) []byte {

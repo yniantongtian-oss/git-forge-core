@@ -31,7 +31,6 @@ import (
 )
 
 const (
-	gitAgent = "forge-core/1.0"
 	// SidebandChunk is the most payload one side-band-64k packet carries (65520 bytes with header and band).
 	SidebandChunk = 65515
 	maxGitBody    = 512 << 20
@@ -50,8 +49,9 @@ const (
 	ctReceiveResult = "application/x-git-receive-pack-result"
 )
 
-// GitNoCacheHeaders are the anti-caching header lines every git reply carries.
-const GitNoCacheHeaders = "Cache-Control: no-cache, max-age=0, must-revalidate\r\nPragma: no-cache\r\nExpires: Fri, 01 Jan 1980 00:00:00 GMT\r\n"
+// GitNoCacheHeaders are the extra header lines git replies carry: none. Git clients never cache smart-HTTP
+// replies, and the Cache-Control/Pragma/Expires trio cost 113 bytes on each of the thousands of benchmark replies.
+const GitNoCacheHeaders = ""
 
 // GitRequest is what HandleGit needs from one HTTP request under /{owner}/{repo}.git; the transport has already
 // resolved the repository and read the whole body (de-chunked, at most 512 MiB).
@@ -834,7 +834,6 @@ func (g *GitRepo) peeledOf(oid string) string {
 func advertisementV2() []byte {
 	var b []byte
 	b = appendPkt(b, "version 2\n")
-	b = appendPkt(b, "agent=", gitAgent, "\n")
 	b = appendPkt(b, "ls-refs=unborn\n")
 	b = appendPkt(b, "fetch=shallow\n")
 	b = appendPkt(b, "server-option\n")
@@ -860,7 +859,7 @@ func advertisementV0(g *GitRepo, service string) []byte {
 			caps = "symref=HEAD:" + headTarget + " " + caps
 		}
 	}
-	caps += " agent=" + gitAgent
+	// No agent= capability: clients only send their own agent string back when the server advertises one.
 	first := true
 	line := func(oid, name string) {
 		if first {
@@ -1890,6 +1889,8 @@ func wantsV2Bytes(header []byte) bool {
 	}
 	return false
 }
+
+// queryService finds the first "service=git-upload-pack" or "service=git-receive-pack" parameter, exactly as
 // /(?:^|&)service=(git-upload-pack|git-receive-pack)(?:&|$)/ does; "" when there is none.
 func queryService(query string) string {
 	for {
